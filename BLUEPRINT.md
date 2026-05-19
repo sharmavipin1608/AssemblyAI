@@ -241,62 +241,175 @@ Migration files live in `alembic/versions/` and are committed to git — same di
 
 ---
 
-## 3. Core Execution Pattern: Dynamic Graph Parsing
+## 3. Engine Layer
 
-The backend reads the database topology and compiles a state machine at runtime.
+The engine is completely decoupled from FastAPI — it has no HTTP concerns. It receives a `project_id` and a `user_input`, compiles a graph, runs it, and streams state events back to the caller.
 
-### State Object Schema
+### 3a. Generic State Shape
+
+A single typed state is shared across all projects. Agents write their outputs into `shared_context` under their own key. This keeps LangGraph happy with a typed schema while remaining fully generic across different pipeline topologies.
 
 ```python
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from typing_extensions import TypedDict
 
+MAX_LOOPS = 10  # hard cap — configurable per-project in a future roadmap item
+
 class ProjectState(TypedDict):
+    run_id:            str
     project_id:        str
     user_input:        str
-    research_notes:    str
-    draft_content:     str
-    checker_feedback:  Dict[str, Any]
+    shared_context:    Dict[str, Any]   # agents read/write here (e.g. shared_context["research_notes"])
+    checker_feedback:  Dict[str, Any]   # structured output from evaluator nodes
+    execution_history: List[str]        # append-only log — one entry per node firing
     current_loops:     int
-    execution_history: List[str]
+    final_output:      Optional[str]    # populated by the terminal node
 ```
 
-### Dynamic Graph Compilation
+### 3b. Graph Compiler
+
+Reads the DB topology and compiles a `StateGraph` at runtime. Every project gets its own compiled graph instance per run.
 
 ```python
 from langgraph.graph import StateGraph, START, END
 
-def compile_dynamic_project_graph(project_id: str):
-    # 1. Fetch configurations from database
+def compile_dynamic_project_graph(project_id: str) -> StateGraph:
     agents_list = db.get_agents_for_project(project_id)
     edges_list  = db.get_workflows_for_project(project_id)
 
-    workflow_graph = StateGraph(ProjectState)
+    graph = StateGraph(ProjectState)
 
-    # 2. Dynamically add nodes from database Agent specs
     for agent in agents_list:
-        # Generic node runner that pulls system prompts from Langfuse
         node_fn = create_generic_agent_node(agent)
-        workflow_graph.add_node(agent.role_key, node_fn)
+        graph.add_node(agent.role_key, node_fn)
 
-    # 3. Add edges and routing rules dynamically
     for edge in edges_list:
         if edge.routing_condition == "always":
-            workflow_graph.add_edge(edge.source_node, edge.target_node)
+            graph.add_edge(edge.source_node, edge.target_node)
         else:
-            # Conditional routing (e.g. Evaluator / Checker logic)
-            condition_router = create_conditional_router(edge)
-            workflow_graph.add_conditional_edges(
-                edge.source_node,
-                condition_router,
-                {
-                    "retry_research": "researcher",
-                    "retry_writer":   "shadow_writer",
-                    "approve":        "publisher",
-                }
-            )
+            router_fn, routing_map = create_conditional_router(edge, agents_list)
+            graph.add_conditional_edges(edge.source_node, router_fn, routing_map)
 
-    return workflow_graph.compile()
+    return graph.compile()
+```
+
+### 3c. Generic Node Runner
+
+Every agent node runs the same function. The full state is passed in — agents use what they need based on their system prompt. Tool calls follow the standard ReAct pattern: the LLM decides if/when to call a tool, the runner executes it, the result is fed back, and the loop continues until the LLM produces a final text response.
+
+```python
+def create_generic_agent_node(agent):
+    async def node_fn(state: ProjectState) -> dict:
+        # 1. Fetch versioned system prompt from Langfuse
+        system_prompt = langfuse.get_prompt(agent.system_prompt_id)
+
+        # 2. Resolve LLM — provider-agnostic via LangChain wrappers
+        llm = get_llm_for_project(agent)  # returns ChatOpenAI or ChatAnthropic
+
+        # 3. Bind tools if this agent has any assigned
+        tools = get_tools_for_agent(agent.id)  # fetches from agent_tools + tool registry
+        if tools:
+            llm = llm.bind_tools(tools)
+
+        # 4. Build messages — full state serialised as context
+        messages = build_messages(system_prompt, state)
+
+        # 5. ReAct loop: call LLM → execute tool calls → repeat until final response
+        response = await run_react_loop(llm, messages, tools)
+
+        # 6. Return state delta
+        return {
+            "shared_context":    {**state["shared_context"], agent.role_key: response.content},
+            "execution_history": state["execution_history"] + [f"{agent.role_key}: {response.content[:100]}..."],
+            "current_loops":     state["current_loops"] + (1 if is_evaluator(agent) else 0),
+        }
+
+    return node_fn
+```
+
+### 3d. LLM Provider Abstraction
+
+`llm.py` instantiates the correct LangChain chat model based on the project's `provider` field. The node runner never references a specific provider.
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+def get_llm_for_project(agent) -> BaseChatModel:
+    config   = db.get_project_config(agent.project_id)
+    api_key  = decrypt(config.api_key_encrypted)
+    model    = agent.model_override or config.default_model
+    temp     = float(agent.temperature)
+
+    if config.provider == "openai":
+        return ChatOpenAI(api_key=api_key, model=model, temperature=temp)
+    if config.provider == "anthropic":
+        return ChatAnthropic(api_key=api_key, model=model, temperature=temp)
+    if config.provider == "groq":
+        return ChatOpenAI(api_key=api_key, model=model, temperature=temp,
+                          base_url="https://api.groq.com/openai/v1")
+    raise ValueError(f"Unknown provider: {config.provider}")
+```
+
+### 3e. Conditional Router
+
+The router evaluates `checker_feedback` from the state and returns the next node key. The routing map (which condition maps to which node) is derived from the edges stored in the DB.
+
+```python
+def create_conditional_router(edge, agents_list):
+    routing_map = {agent.role_key: agent.role_key for agent in agents_list}
+    routing_map["END"] = END
+
+    def router_fn(state: ProjectState) -> str:
+        if state["current_loops"] >= MAX_LOOPS:
+            return "END"
+        feedback = state.get("checker_feedback", {})
+        if feedback.get("approved"):
+            return "END"
+        return feedback.get("flaw_location", "END")
+
+    return router_fn, routing_map
+```
+
+### 3f. Tool Registry
+
+Built-in tools are registered at startup. Each tool is a plain async Python function that takes a string input and returns a string result. The registry maps `tool_key` → callable for the node runner to look up.
+
+```python
+# engine/tools/registry.py
+TOOL_REGISTRY: Dict[str, Callable] = {}
+
+def register(tool_key: str):
+    def decorator(fn):
+        TOOL_REGISTRY[tool_key] = fn
+        return fn
+    return decorator
+
+def get_tools_for_agent(agent_id: str) -> List[BaseTool]:
+    assigned = db.get_tools_for_agent(agent_id)
+    return [wrap_as_langchain_tool(TOOL_REGISTRY[t.tool_key], t) for t in assigned]
+```
+
+```python
+# engine/tools/web_search.py
+@register("web_search")
+async def web_search(query: str) -> str:
+    ...
+
+# engine/tools/code_executor.py
+@register("code_executor")
+async def code_executor(code: str) -> str:
+    ...
+
+# engine/tools/file_reader.py
+@register("file_reader")
+async def file_reader(path: str) -> str:
+    ...
+
+# engine/tools/calculator.py
+@register("calculator")
+async def calculator(expression: str) -> str:
+    ...
 ```
 
 ---
@@ -497,3 +610,7 @@ These are intentionally out of scope for v1 to keep the initial build tangible a
 | **Workflow versioning** | Snapshot graph topology at run time so old runs remain replayable after the workflow is edited |
 | **Custom HTTP tool endpoints** | Let users register their own API endpoints as agent tools, configured via URL + headers + payload schema |
 | **Agent memory** | Persist per-agent context across runs for long-running or stateful workflows |
+| **Per-project max_loops config** | Store loop cap in the DB per project instead of the global `MAX_LOOPS = 10` constant |
+| **Per-agent input field mapping** | Let each agent declare which state fields it reads instead of receiving full state — reduces LLM noise on large states |
+| **Per-project state schema** | Define a custom typed state shape per project in the DB for maximum flexibility across radically different pipeline types |
+| **Parallel agent execution** | Run N agents simultaneously against the same goal and compare outputs — foundation for Agent Forge integration |
