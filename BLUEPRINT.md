@@ -359,15 +359,121 @@ The conditional router reads `ProjectState["checker_feedback"]["flaw_location"]`
 
 | Layer | Technology | Rationale |
 |-------|-----------|-----------|
-| **Backend Runtime** | FastAPI (Python) | Native async I/O, SSE/WebSocket streaming, clean integration with agent libraries |
-| **Orchestration** | LangGraph | Built for cyclic state propagation, loops, and human-in-the-loop interruption |
-| **Observability** | Langfuse | Visual trace explorer for complex loops; tracks latency, token costs, and exact execution paths |
+| **Backend Runtime** | FastAPI (Python) | Native async I/O, SSE streaming, clean integration with agent libraries |
+| **Orchestration** | LangGraph | Built for cyclic state propagation and loops |
+| **DB Migrations** | SQLAlchemy + Alembic | ORM models as source of truth; auto-generated versioned migration files |
+| **Observability** | Langfuse (self-hosted, Docker) | Visual trace explorer; tracks latency, token costs, and exact execution paths |
 | **Frontend** | React + Tailwind CSS + React Flow | React Flow enables a visual canvas where users wire agent cards into workflow graphs |
-| **Database** | PostgreSQL (Docker) | Self-contained, portable between local and Oracle Free Tier; same container config across environments |
+| **Database** | PostgreSQL (Docker) | Self-contained, portable between local and Oracle Free Tier |
 
 ---
 
-## 6. Development Phasing
+## 6. FastAPI Layer
+
+### Project Structure
+
+```
+assembly_ai/
+├── main.py                    # App entry — creates FastAPI instance, mounts routers, CORS
+├── core/
+│   ├── config.py              # Pydantic-settings: DB URL, ASSEMBLY_SECRET_KEY, env flags
+│   ├── database.py            # Async SQLAlchemy engine + session factory (AsyncSession)
+│   └── security.py            # Fernet encrypt() / decrypt() helpers for API keys
+├── models/                    # SQLAlchemy ORM models — talks to the DB
+│   └── db.py
+├── schemas/                   # Pydantic request/response shapes — talks to the API client
+│   ├── project.py             # ProjectCreate, ProjectResponse
+│   ├── agent.py               # AgentCreate, AgentUpdate, AgentResponse
+│   ├── tool.py                # ToolCreate, ToolResponse
+│   ├── workflow.py            # WorkflowCreate, WorkflowResponse
+│   └── run.py                 # RunCreate, RunResponse, RunDetail (includes node logs)
+├── api/
+│   └── v1/
+│       ├── projects.py
+│       ├── agents.py
+│       ├── tools.py
+│       ├── workflows.py
+│       └── runs.py            # Includes SSE streaming endpoint
+├── engine/                    # LangGraph orchestration — no HTTP concerns here
+│   ├── compiler.py            # compile_dynamic_project_graph()
+│   ├── nodes.py               # create_generic_agent_node()
+│   ├── conditional.py         # create_conditional_router()
+│   └── tools/
+│       ├── registry.py        # Maps tool_key → callable
+│       ├── web_search.py
+│       ├── code_executor.py
+│       ├── file_reader.py
+│       └── calculator.py
+└── services/
+    ├── llm.py                 # Provider abstraction: OpenAI / Anthropic / Groq
+    └── langfuse.py            # Langfuse client wrapper
+```
+
+> **`models/` vs `schemas/` rule:** `models/` defines what the database looks like. `schemas/` defines what the API accepts and returns. They are always kept separate. A response schema like `ProjectConfigResponse` returns `provider` and `default_model` but never `api_key_encrypted`.
+
+### API Endpoints
+
+All resources are nested under `/api/v1/projects/{id}/` because everything is project-scoped.
+
+```
+# Projects
+POST   /api/v1/projects
+GET    /api/v1/projects
+GET    /api/v1/projects/{id}
+DELETE /api/v1/projects/{id}
+
+# LLM Config (API key stored encrypted, never returned in responses)
+POST   /api/v1/projects/{id}/config
+GET    /api/v1/projects/{id}/config
+
+# Agents
+POST   /api/v1/projects/{id}/agents
+GET    /api/v1/projects/{id}/agents
+PUT    /api/v1/projects/{id}/agents/{agent_id}
+DELETE /api/v1/projects/{id}/agents/{agent_id}
+
+# Tool assignment to agents
+POST   /api/v1/projects/{id}/agents/{agent_id}/tools/{tool_id}
+DELETE /api/v1/projects/{id}/agents/{agent_id}/tools/{tool_id}
+
+# Tools
+POST   /api/v1/projects/{id}/tools
+GET    /api/v1/projects/{id}/tools
+PUT    /api/v1/projects/{id}/tools/{tool_id}
+DELETE /api/v1/projects/{id}/tools/{tool_id}
+
+# Workflow edges
+POST   /api/v1/projects/{id}/workflows
+GET    /api/v1/projects/{id}/workflows
+DELETE /api/v1/projects/{id}/workflows/{workflow_id}
+
+# Runs
+POST   /api/v1/projects/{id}/runs             # triggers execution, returns run_id immediately
+GET    /api/v1/projects/{id}/runs             # list all runs for a project
+GET    /api/v1/projects/{id}/runs/{run_id}    # full run detail + all node logs (post-completion review)
+GET    /api/v1/projects/{id}/runs/{run_id}/stream   # SSE: live node-by-node output while running
+```
+
+### Streaming Pattern (SSE)
+
+The run is triggered via `POST /runs` which returns the `run_id` immediately. The client then opens an SSE connection to `/runs/{run_id}/stream` and receives one event per node completion:
+
+```json
+event: node_complete
+data: {"node": "researcher", "loop_index": 0, "sequence_order": 1, "output": "..."}
+
+event: node_complete
+data: {"node": "shadow_writer", "loop_index": 0, "sequence_order": 2, "output": "..."}
+
+event: run_complete
+data: {"status": "completed", "total_loops": 1}
+```
+
+Human review happens after the run — `GET /runs/{run_id}` returns the full state including all node logs and the final output. No mid-run interruption in v1.
+
+---
+
+## 7. Development Phasing
 
 ### Phase 1 — Hardcoded Core (Week 1)
 Build the Project Writer agent as a standalone Python script. Use hardcoded LangGraph nodes and in-memory state. Goal: get the self-correction loop working locally — the Checker should reject the draft at least once before the Publisher fires.
@@ -376,22 +482,18 @@ Build the Project Writer agent as a standalone Python script. Use hardcoded Lang
 Extract all hardcoded configs into a `project_writer_spec.json` file. Refactor the engine to be config-driven: it reads the JSON and constructs the agent loop from that spec alone. Wire in **Langfuse** at this stage to capture trace metrics and prompt versions.
 
 ### Phase 3 — Platform Layer (Weeks 3–4)
-Migrate the JSON spec into PostgreSQL/Supabase. Wrap the engine in a **FastAPI** server and expose endpoints:
-- `POST /api/projects/create`
-- `POST /api/projects/{id}/run`
-- `GET  /api/projects/{id}/runs/{run_id}/stream`
-
-Build a minimal frontend that lets you define agents and prompts, connect them visually via React Flow, and trigger runs with live streaming output.
+Migrate the JSON spec into PostgreSQL. Wrap the engine in a **FastAPI** server, apply the full schema via Alembic, and expose the v1 endpoints. Build a minimal frontend that lets you define agents and prompts, connect them visually via React Flow, and trigger runs with live SSE streaming output.
 
 ---
 
-## 7. Future Roadmap
+## 8. Future Roadmap
 
 These are intentionally out of scope for v1 to keep the initial build tangible and shippable.
 
 | Item | Description |
 |------|-------------|
+| **Auth / multi-user** | API key or JWT protection on all endpoints; per-user project isolation |
+| **Human-in-the-loop (mid-run)** | Allow a run to pause at a designated node and wait for human input before continuing — requires WebSockets |
 | **Workflow versioning** | Snapshot graph topology at run time so old runs remain replayable after the workflow is edited |
 | **Custom HTTP tool endpoints** | Let users register their own API endpoints as agent tools, configured via URL + headers + payload schema |
 | **Agent memory** | Persist per-agent context across runs for long-running or stateful workflows |
-| **Multi-user / auth** | Per-user project isolation, role-based access |
