@@ -5,32 +5,49 @@
 ## 1. High-Level Architecture
 
 ```
-+-------------------------------------------------------------+
-|                        Unified UI                           |
-|      (React / React Flow Canvas / Chat & State View)        |
-+------------------------------+------------------------------+
-                               |
-                   API (REST / WebSockets)
-                               |
-+------------------------------v------------------------------+
-|                    Dynamic Backend Engine                   |
-|                  (FastAPI / Python Runtime)                 |
-+------------------------------+------------------------------+
-                               |
-             +-----------------+-----------------+
-             |                                   |
-+------------v--------------+     +--------------v-----------+
-|    Orchestrator Engine    |     |    Metadata & State DB   |
-|  (Compiles graphs         |     |  (PostgreSQL / Supabase) |
-|   dynamically via         |     |  Stores: Specs, Logs,    |
-|   LangGraph / Code)       |     |  Runs                    |
-+------------+--------------+     +--------------------------+
-             |
-+------------v----------------------------------------------------------+
-|                  Observability & Prompts Layer (Langfuse)             |
-|  - Manages prompt version history                                     |
-|  - Tracks LLM tokens, costs, loops, and deep-nested tool calls        |
-+-----------------------------------------------------------------------+
++----------------------------------------------------------------------+
+|                            CLIENT                                    |
+|                  React + Tailwind CSS + React Flow                   |
+|          Canvas (workflow builder)  |  Chat / State / Run View       |
++-----------------------------------+----------------------------------+
+                                    |
+                       REST (CRUD) + SSE (run streaming)
+                                    |
++-----------------------------------v----------------------------------+
+|                          FASTAPI BACKEND                             |
+|   /api/v1/  ·  Pydantic schemas  ·  core/security  ·  Alembic       |
++------------------+----------------------------+---------------------+
+                   |                            |
+                   |              +-------------v--------------+
+                   |              |        PostgreSQL           |
+                   |              |         (Docker)            |
+                   |              |  projects  ·  agents        |
+                   |              |  tools     ·  workflows     |
+                   |              |  runs      ·  run_node_logs |
+                   |              +----------------------------+
+                   |
++------------------v---------------------------------------------------+
+|                           ENGINE LAYER                               |
+|                                                                      |
+|  +------------------+  +-------------------+  +------------------+  |
+|  |  compiler.py     |  |  nodes.py         |  |  conditional.py  |  |
+|  |  Builds          |  |  Generic node     |  |  Evaluates state |  |
+|  |  StateGraph      |  |  runner (ReAct)   |  |  Routes edges    |  |
+|  |  from DB         |  |  for every agent  |  |  MAX_LOOPS guard |  |
+|  +------------------+  +-------------------+  +------------------+  |
+|                                                                      |
+|  +----------------------------------------------------------------+  |
+|  |                       TOOL REGISTRY                            |  |
+|  |    web_search  ·  code_executor  ·  file_reader  ·  calculator |  |
+|  +----------------------------------------------------------------+  |
++------------------+----------------------------+---------------------+
+                   |                            |
++------------------v--------------+  +----------v---------------------+
+|        LLM PROVIDERS            |  |   LANGFUSE  (Docker)           |
+|   via LangChain wrappers        |  |   · Prompt version storage     |
+|   ChatOpenAI  (OpenAI / Groq)   |  |   · Trace + span per run       |
+|   ChatAnthropic                 |  |   · Token costs · latency      |
++---------------------------------+  +--------------------------------+
 ```
 
 ---
@@ -414,7 +431,70 @@ async def calculator(expression: str) -> str:
 
 ---
 
-## 4. Self-Correction Feedback Loop
+## 4. Single Run — Execution Trace
+
+How one run flows through the full system, from the client's first request to the final detail view. This sequence applies to any project graph, not just the Project Writer example.
+
+```
+  CLIENT              FASTAPI              ENGINE              POSTGRESQL        LANGFUSE
+    |                    |                    |                     |                |
+    |--POST /runs------->|                    |                     |                |
+    |                    |--INSERT run (queued)------------------>  |                |
+    |<--{run_id}---------|                    |                     |                |
+    |                    |                    |                     |                |
+    |--GET /stream------>| (SSE connection open)                    |                |
+    |                    |--compile_graph()-->|                     |                |
+    |                    |                    |--SELECT agents/workflows---------->  |
+    |                    |                    |<----------------------------------   |
+    |                    |                    |                     |                |
+    |                    |             +------+------+              |                |
+    |                    |             | researcher  |              |                |
+    |                    |             |             |--get_prompt()---------------->|
+    |                    |             |             |--LLM call (+ tool calls if any)|
+    |                    |             |             |--INSERT node_log----------->  |
+    |                    |             |             |--emit state delta             |
+    |<--node_complete----|             +------+------+              |                |
+    |                    |                    |                     |                |
+    |                    |             +------+------+              |                |
+    |                    |             |shadow_writer|              |                |
+    |                    |             |             |--get_prompt()---------------->|
+    |                    |             |             |--LLM call                     |
+    |                    |             |             |--INSERT node_log----------->  |
+    |<--node_complete----|             +------+------+              |                |
+    |                    |                    |                     |                |
+    |                    |             +------+------+              |                |
+    |                    |             |   checker   |              |                |
+    |                    |             |             |--get_prompt()---------------->|
+    |                    |             |             |--LLM call -> checker_feedback |
+    |                    |             |             |--INSERT node_log----------->  |
+    |                    |             +------+------+              |                |
+    |                    |                    |                     |                |
+    |                    |         +----------+------------------+  |                |
+    |                    |         |   conditional router        |  |                |
+    |                    |         |   approved? --NO--> researcher (loop repeats)   |
+    |                    |         |             --YES-> publisher                   |
+    |                    |         +----------+------------------+  |                |
+    |                    |                    |                     |                |
+    |                    |             +------+------+              |                |
+    |                    |             |  publisher  |              |                |
+    |                    |             |             |--LLM call                     |
+    |                    |             |             |--UPDATE run (completed)---->  |
+    |<--run_complete-----|             +-------------+              |                |
+    |                    |                                          |                |
+    |--GET /runs/{id}--->|                                          |                |
+    |                    |--SELECT run + node_logs---------------->  |                |
+    |<--full detail------|                                          |                |
+```
+
+**Key points:**
+- `POST /runs` returns `run_id` immediately — the client never blocks on execution
+- The SSE stream emits one `node_complete` event per node firing, including loop iterations
+- Every node log row in PostgreSQL links to a Langfuse span ID for deep-dive debugging
+- Human review is a plain `GET /runs/{id}` after the run completes — no mid-run interruption in v1
+
+---
+
+## 5. Self-Correction Feedback Loop
 
 The Project Writer workflow relies on conditional edge routing driven by evaluation grading fields.
 
