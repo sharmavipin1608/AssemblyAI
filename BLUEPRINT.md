@@ -37,7 +37,7 @@
 
 ## 2. Database Schema
 
-The entire configuration of your project workspace — agent personas and structural flow logic — is stored relationally.
+### Definition Layer — what a project looks like
 
 ```sql
 -- 1. Project Container
@@ -48,34 +48,87 @@ CREATE TABLE projects (
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- 2. Project-Level API Keys / LLM Configuration
+-- 2. Project-Level LLM Configuration
+--    api_key_encrypted stores a Fernet-encrypted ciphertext.
+--    The master encryption key lives as an environment variable (ASSEMBLY_SECRET_KEY).
 CREATE TABLE project_configs (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    project_id          UUID REFERENCES projects(id) ON DELETE CASCADE,
-    provider            VARCHAR(50)  NOT NULL,  -- e.g. 'openai', 'anthropic'
-    api_key_vault_sec_id VARCHAR(255),           -- Reference to an encrypted vault secret
-    default_model       VARCHAR(100) NOT NULL
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id        UUID REFERENCES projects(id) ON DELETE CASCADE,
+    provider          VARCHAR(50)  NOT NULL,   -- 'openai' | 'anthropic' | 'groq'
+    api_key_encrypted TEXT         NOT NULL,
+    default_model     VARCHAR(100) NOT NULL
 );
 
 -- 3. Dynamic Agents
 CREATE TABLE agents (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id       UUID REFERENCES projects(id) ON DELETE CASCADE,
-    role_key         VARCHAR(100) NOT NULL,  -- e.g. 'researcher', 'shadow_writer'
+    role_key         VARCHAR(100) NOT NULL,   -- e.g. 'researcher', 'shadow_writer'
     display_name     VARCHAR(255) NOT NULL,
-    system_prompt_id VARCHAR(255) NOT NULL,  -- Versioned inside Langfuse
+    system_prompt_id VARCHAR(255) NOT NULL,   -- Prompt name/version managed in Langfuse
     model_override   VARCHAR(100) NULL,
     temperature      NUMERIC(2,1) DEFAULT 0.2
 );
 
--- 4. Dynamic Execution Graph Topology (Routing Edges)
+-- 4. Built-in Tools (v1: web_search, code_executor, file_reader, calculator)
+CREATE TABLE tools (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id   UUID REFERENCES projects(id) ON DELETE CASCADE,
+    tool_key     VARCHAR(100) NOT NULL,   -- matches a registered built-in key
+    display_name VARCHAR(255) NOT NULL,
+    description  TEXT         NOT NULL,  -- shown to the LLM at runtime
+    config       JSONB        NOT NULL DEFAULT '{}',  -- tool-specific overrides
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5. Agent <-> Tool Assignment (many-to-many)
+CREATE TABLE agent_tools (
+    agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+    tool_id  UUID REFERENCES tools(id)  ON DELETE CASCADE,
+    PRIMARY KEY (agent_id, tool_id)
+);
+
+-- 6. Execution Graph Topology (Routing Edges)
 CREATE TABLE workflows (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id        UUID REFERENCES projects(id) ON DELETE CASCADE,
-    source_node       VARCHAR(100) NOT NULL,  -- Agent role_key or 'START'
-    target_node       VARCHAR(100) NOT NULL,  -- Agent role_key or 'END'
-    routing_condition VARCHAR(100) NOT NULL DEFAULT 'always',  -- 'always', 'if_approved', 'if_gap_found'
+    source_node       VARCHAR(100) NOT NULL,   -- agent role_key or 'START'
+    target_node       VARCHAR(100) NOT NULL,   -- agent role_key or 'END'
+    routing_condition VARCHAR(100) NOT NULL DEFAULT 'always',  -- 'always' | 'if_approved' | 'if_gap_found'
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Execution Layer — what happened when it ran
+
+```sql
+-- 7. Runs — one row per graph execution
+CREATE TABLE runs (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id        UUID REFERENCES projects(id) ON DELETE CASCADE,
+    status            VARCHAR(20)  NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed
+    user_input        TEXT         NOT NULL,
+    final_state       JSONB,         -- full ProjectState snapshot at completion
+    total_loops       INT          NOT NULL DEFAULT 0,
+    langfuse_trace_id VARCHAR(255),  -- top-level trace ID for cross-referencing in Langfuse
+    error_message     TEXT,          -- populated on failure
+    started_at        TIMESTAMP,
+    completed_at      TIMESTAMP,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 8. Run Node Logs — one row per node firing per run
+CREATE TABLE run_node_logs (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id           UUID REFERENCES runs(id) ON DELETE CASCADE,
+    node_role_key    VARCHAR(100) NOT NULL,
+    sequence_order   INT          NOT NULL,   -- global firing order within the run
+    loop_index       INT          NOT NULL DEFAULT 0,  -- which self-correction iteration
+    input_snapshot   JSONB,        -- state entering the node
+    output_snapshot  JSONB,        -- state delta produced by the node
+    langfuse_span_id VARCHAR(255), -- span ID for this node in Langfuse
+    started_at       TIMESTAMP,
+    completed_at     TIMESTAMP
 );
 ```
 
@@ -203,7 +256,7 @@ The conditional router reads `ProjectState["checker_feedback"]["flaw_location"]`
 | **Orchestration** | LangGraph | Built for cyclic state propagation, loops, and human-in-the-loop interruption |
 | **Observability** | Langfuse | Visual trace explorer for complex loops; tracks latency, token costs, and exact execution paths |
 | **Frontend** | React + Tailwind CSS + React Flow | React Flow enables a visual canvas where users wire agent cards into workflow graphs |
-| **Database** | PostgreSQL / Supabase | Relational schema fits the project/agent/workflow topology; Supabase adds a real-time layer and easy auth |
+| **Database** | PostgreSQL (Docker) | Self-contained, portable between local and Oracle Free Tier; same container config across environments |
 
 ---
 
@@ -222,3 +275,16 @@ Migrate the JSON spec into PostgreSQL/Supabase. Wrap the engine in a **FastAPI**
 - `GET  /api/projects/{id}/runs/{run_id}/stream`
 
 Build a minimal frontend that lets you define agents and prompts, connect them visually via React Flow, and trigger runs with live streaming output.
+
+---
+
+## 7. Future Roadmap
+
+These are intentionally out of scope for v1 to keep the initial build tangible and shippable.
+
+| Item | Description |
+|------|-------------|
+| **Workflow versioning** | Snapshot graph topology at run time so old runs remain replayable after the workflow is edited |
+| **Custom HTTP tool endpoints** | Let users register their own API endpoints as agent tools, configured via URL + headers + payload schema |
+| **Agent memory** | Persist per-agent context across runs for long-running or stateful workflows |
+| **Multi-user / auth** | Per-user project isolation, role-based access |
