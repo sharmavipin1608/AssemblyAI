@@ -132,6 +132,113 @@ CREATE TABLE run_node_logs (
 );
 ```
 
+### SQLAlchemy Models (Python source of truth)
+
+Alembic diffs these models against the live DB to auto-generate migration files. The raw SQL above is reference only.
+
+```python
+import uuid
+from sqlalchemy import Column, String, Text, Numeric, Integer, ForeignKey, TIMESTAMP
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.sql import func
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name        = Column(String(255), nullable=False)
+    description = Column(Text)
+    created_at  = Column(TIMESTAMP, server_default=func.now())
+
+class ProjectConfig(Base):
+    __tablename__ = "project_configs"
+    id                = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id        = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    provider          = Column(String(50),  nullable=False)
+    api_key_encrypted = Column(Text,        nullable=False)
+    default_model     = Column(String(100), nullable=False)
+
+class Agent(Base):
+    __tablename__ = "agents"
+    id               = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id       = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    role_key         = Column(String(100), nullable=False)
+    display_name     = Column(String(255), nullable=False)
+    system_prompt_id = Column(String(255), nullable=False)
+    model_override   = Column(String(100))
+    temperature      = Column(Numeric(2, 1), default=0.2)
+
+class Tool(Base):
+    __tablename__ = "tools"
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id   = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    tool_key     = Column(String(100), nullable=False)
+    display_name = Column(String(255), nullable=False)
+    description  = Column(Text,        nullable=False)
+    config       = Column(JSONB,        nullable=False, server_default="{}")
+    created_at   = Column(TIMESTAMP,   server_default=func.now())
+
+class AgentTool(Base):
+    __tablename__ = "agent_tools"
+    agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), primary_key=True)
+    tool_id  = Column(UUID(as_uuid=True), ForeignKey("tools.id",  ondelete="CASCADE"), primary_key=True)
+
+class Workflow(Base):
+    __tablename__ = "workflows"
+    id                = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id        = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    source_node       = Column(String(100), nullable=False)
+    target_node       = Column(String(100), nullable=False)
+    routing_condition = Column(String(100), nullable=False, default="always")
+    created_at        = Column(TIMESTAMP,   server_default=func.now())
+
+class Run(Base):
+    __tablename__ = "runs"
+    id                = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id        = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    status            = Column(String(20),  nullable=False, default="queued")
+    user_input        = Column(Text,        nullable=False)
+    final_state       = Column(JSONB)
+    total_loops       = Column(Integer,     nullable=False, default=0)
+    langfuse_trace_id = Column(String(255))
+    error_message     = Column(Text)
+    started_at        = Column(TIMESTAMP)
+    completed_at      = Column(TIMESTAMP)
+    created_at        = Column(TIMESTAMP,   server_default=func.now())
+
+class RunNodeLog(Base):
+    __tablename__ = "run_node_logs"
+    id               = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id           = Column(UUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False)
+    node_role_key    = Column(String(100), nullable=False)
+    sequence_order   = Column(Integer,     nullable=False)
+    loop_index       = Column(Integer,     nullable=False, default=0)
+    input_snapshot   = Column(JSONB)
+    output_snapshot  = Column(JSONB)
+    langfuse_span_id = Column(String(255))
+    started_at       = Column(TIMESTAMP)
+    completed_at     = Column(TIMESTAMP)
+```
+
+### Migration Workflow (Alembic)
+
+```
+# One-time setup
+alembic init alembic
+
+# After any model change
+alembic revision --autogenerate -m "describe the change"
+alembic upgrade head
+
+# Roll back one step
+alembic downgrade -1
+```
+
+Migration files live in `alembic/versions/` and are committed to git — same discipline as Flyway versioned scripts, just Python-generated.
+
 ---
 
 ## 3. Core Execution Pattern: Dynamic Graph Parsing
